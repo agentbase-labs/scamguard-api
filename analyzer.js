@@ -4,12 +4,31 @@ import NodeCache from 'node-cache';
 // Cache for 5 minutes
 const cache = new NodeCache({ stdTTL: 300 });
 
+// ==================== CHAIN DETECTION ====================
+
+/**
+ * Detect blockchain type from address format
+ */
+function detectChain(address) {
+  // Ethereum/BSC: 0x + 40 hex chars
+  if (/^0x[a-fA-F0-9]{40}$/.test(address)) {
+    return 'evm';
+  }
+  
+  // Solana: base58, typically 32-44 chars, no 0x prefix
+  if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)) {
+    return 'solana';
+  }
+  
+  return 'unknown';
+}
+
 // ==================== API INTEGRATIONS ====================
 
 /**
  * Fetch token data from Dexscreener
  */
-async function fetchDexscreener(address) {
+async function fetchDexscreener(address, chain = 'evm') {
   try {
     const cached = cache.get(`dex_${address}`);
     if (cached) return cached;
@@ -49,9 +68,9 @@ async function fetchDexscreener(address) {
 }
 
 /**
- * Fetch RugCheck safety score
+ * Fetch RugCheck safety score (supports both EVM and Solana)
  */
-async function fetchRugCheck(address) {
+async function fetchRugCheck(address, chain = 'evm') {
   try {
     const cached = cache.get(`rug_${address}`);
     if (cached) return cached;
@@ -77,9 +96,14 @@ async function fetchRugCheck(address) {
 }
 
 /**
- * Check honeypot status
+ * Check honeypot status (EVM only - Solana uses RugCheck)
  */
-async function checkHoneypot(address) {
+async function checkHoneypot(address, chain = 'evm') {
+  // Honeypot.is only supports EVM chains
+  if (chain === 'solana') {
+    return { isHoneypot: false, buyTax: 0, sellTax: 0, transferTax: 0 };
+  }
+
   try {
     const cached = cache.get(`honey_${address}`);
     if (cached) return cached;
@@ -106,9 +130,14 @@ async function checkHoneypot(address) {
 }
 
 /**
- * Fetch contract verification and holder count from Etherscan
+ * Fetch contract verification and holder count from Etherscan (EVM only)
  */
-async function fetchEtherscan(address) {
+async function fetchEtherscan(address, chain = 'evm') {
+  // Etherscan only for EVM chains
+  if (chain === 'solana') {
+    return { verified: false, holderCount: 0 };
+  }
+
   try {
     const apiKey = process.env.ETHERSCAN_API_KEY;
     if (!apiKey) return { verified: false, holderCount: 0 };
@@ -136,6 +165,42 @@ async function fetchEtherscan(address) {
   } catch (error) {
     console.error(`Etherscan error for ${address}:`, error.message);
     return { verified: false, holderCount: 0 };
+  }
+}
+
+/**
+ * Fetch Solana token holder info from Birdeye API
+ */
+async function fetchBirdeye(address) {
+  try {
+    const apiKey = process.env.BIRDEYE_API_KEY;
+    const cached = cache.get(`birdeye_${address}`);
+    if (cached) return cached;
+
+    if (!apiKey) {
+      console.log('Birdeye API key not set, skipping holder count');
+      return { holderCount: 0, verified: false };
+    }
+
+    const response = await axios.get(
+      `https://public-api.birdeye.so/defi/token_overview?address=${address}`,
+      { 
+        headers: { 'X-API-KEY': apiKey },
+        timeout: 10000 
+      }
+    );
+
+    const data = response.data.data;
+    const result = {
+      holderCount: data?.holder || 0,
+      verified: data?.verified || false
+    };
+
+    cache.set(`birdeye_${address}`, result);
+    return result;
+  } catch (error) {
+    console.error(`Birdeye error for ${address}:`, error.message);
+    return { holderCount: 0, verified: false };
   }
 }
 
@@ -255,15 +320,40 @@ export async function analyzeTokens(addresses) {
   const results = await Promise.all(
     addresses.map(async (address) => {
       try {
-        console.log(`Analyzing ${address}...`);
+        // Detect chain type
+        const chain = detectChain(address);
+        
+        console.log(`Analyzing ${address} (${chain})...`);
 
-        // Fetch data from all sources in parallel
-        const [dexData, rugData, honeyData, ethData] = await Promise.all([
-          fetchDexscreener(address),
-          fetchRugCheck(address),
-          checkHoneypot(address),
-          fetchEtherscan(address)
-        ]);
+        if (chain === 'unknown') {
+          return {
+            address,
+            error: 'Unknown address format',
+            score: 0,
+            riskLevel: 'UNKNOWN',
+            recommendation: 'SKIP',
+            chain: 'unknown'
+          };
+        }
+
+        // Fetch data from all sources in parallel (chain-aware)
+        let dexData, rugData, honeyData, chainData;
+
+        if (chain === 'solana') {
+          [dexData, rugData, chainData] = await Promise.all([
+            fetchDexscreener(address, chain),
+            fetchRugCheck(address, chain),
+            fetchBirdeye(address)
+          ]);
+          honeyData = { isHoneypot: false, buyTax: 0, sellTax: 0, transferTax: 0 };
+        } else {
+          [dexData, rugData, honeyData, chainData] = await Promise.all([
+            fetchDexscreener(address, chain),
+            fetchRugCheck(address, chain),
+            checkHoneypot(address, chain),
+            fetchEtherscan(address, chain)
+          ]);
+        }
 
         if (!dexData) {
           return {
@@ -271,7 +361,8 @@ export async function analyzeTokens(addresses) {
             error: 'Token not found on DEX',
             score: 0,
             riskLevel: 'UNKNOWN',
-            recommendation: 'SKIP'
+            recommendation: 'SKIP',
+            chain
           };
         }
 
@@ -280,11 +371,11 @@ export async function analyzeTokens(addresses) {
           liquidity: dexData.liquidity,
           volume24h: dexData.volume24h,
           safetyScore: rugData.score,
-          holderCount: ethData.holderCount,
+          holderCount: chainData.holderCount,
           priceChange24h: dexData.priceChange24h,
           buyTax: honeyData.buyTax,
           sellTax: honeyData.sellTax,
-          verified: ethData.verified,
+          verified: chainData.verified,
           isHoneypot: honeyData.isHoneypot,
           isScam: rugData.isScam
         };
@@ -309,10 +400,11 @@ export async function analyzeTokens(addresses) {
           priceChange24h: dexData.priceChange24h,
           buyTax: honeyData.buyTax,
           sellTax: honeyData.sellTax,
-          verified: ethData.verified,
+          verified: chainData.verified,
           safetyScore: rugData.score,
           redFlags,
-          pairAddress: dexData.pairAddress
+          pairAddress: dexData.pairAddress,
+          chain
         };
 
       } catch (error) {

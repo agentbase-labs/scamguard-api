@@ -45,15 +45,20 @@ app.post('/api/analyze', async (req, res) => {
       });
     }
 
-    // Validate address format (basic check)
-    const validAddresses = addresses.filter(addr => 
-      typeof addr === 'string' && 
-      /^0x[a-fA-F0-9]{40}$/.test(addr.trim())
-    );
+    // Validate address format (EVM or Solana)
+    const validAddresses = addresses.filter(addr => {
+      if (typeof addr !== 'string') return false;
+      const trimmed = addr.trim();
+      // EVM: 0x + 40 hex chars
+      const isEVM = /^0x[a-fA-F0-9]{40}$/.test(trimmed);
+      // Solana: base58, 32-44 chars
+      const isSolana = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(trimmed);
+      return isEVM || isSolana;
+    });
 
     if (validAddresses.length === 0) {
       return res.status(400).json({ 
-        error: 'No valid Ethereum/BSC addresses found.' 
+        error: 'No valid addresses found. Supported: Ethereum, BSC, and Solana addresses.' 
       });
     }
 
